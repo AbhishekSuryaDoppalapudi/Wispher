@@ -1,0 +1,11 @@
+torch
+torchaudio
+transformers
+sentencepiece
+openai-whisper
+gradio
+pydub
+soundfile
+numpy
+IndicTransToolkit
+git+https://github.com/huggingface/parler-tts.git

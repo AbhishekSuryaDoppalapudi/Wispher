@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Media and outputs (never commit videos)
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+*.srt
+outputs/
+
+# Secrets and editor files
+.env
+.vscode/
+.DS_Store
