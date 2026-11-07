@@ -1,8 +1,9 @@
-import os, gc, subprocess, tempfile
+import os, gc, time, shutil, subprocess, tempfile
 import torch, numpy as np, soundfile as sf
 import whisper
 import gradio as gr
 from pydub import AudioSegment
+from pydub.silence import detect_leading_silence
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 try:
     from IndicTransToolkit.processor import IndicProcessor
@@ -23,10 +24,11 @@ LANGS = {
 }
 CODE_TO_NAME = {v: k for k, v in LANGS.items()}
 
-# Languages Indic Parler-TTS can speak. Others still get translated subtitles.
+# Languages Indic Parler-TTS can speak (conservative list - check the model card before adding
+# more). Others still get translated subtitles.
 TTS_LANGS = {"Assamese", "Bengali", "Bodo", "Dogri", "English", "Gujarati", "Hindi", "Kannada",
-             "Kashmiri", "Konkani", "Maithili", "Malayalam", "Manipuri", "Marathi", "Nepali",
-             "Odia", "Punjabi", "Sanskrit", "Santali", "Tamil", "Telugu", "Urdu"}
+             "Konkani", "Maithili", "Malayalam", "Manipuri", "Marathi", "Nepali", "Odia",
+             "Punjabi", "Sanskrit", "Santali", "Tamil", "Telugu"}
 
 # Spoken languages Whisper can recognise in the uploaded video
 WHISPER_TO_FLORES = {
@@ -36,18 +38,48 @@ WHISPER_TO_FLORES = {
 }
 FLORES_TO_WHISPER = {v: k for k, v in WHISPER_TO_FLORES.items()}
 
-VOICES = {
-    "Female": "A female speaker delivers clear, natural speech at a moderate pace and pitch. "
-              "The recording is of very high quality, with the voice sounding close up and clear.",
-    "Male": "A male speaker delivers clear, natural speech at a moderate pace and pitch. "
-            "The recording is of very high quality, with the voice sounding close up and clear.",
+# Indic Parler-TTS has named speakers per language; using the same name for every line keeps
+# the voice consistent (names from the model card). (female, male). Languages without their own
+# speaker (Konkani, Maithili, Santali) use the Hindi voices.
+SPEAKERS = {
+    "Assamese": ("Sita", "Amit"), "Bengali": ("Aditi", "Arjun"), "Bodo": ("Maya", "Bikram"),
+    "Dogri": ("Karan", "Karan"), "English": ("Mary", "Thoma"), "Gujarati": ("Neha", "Yash"),
+    "Hindi": ("Divya", "Rohit"), "Kannada": ("Anu", "Suresh"), "Malayalam": ("Anjali", "Harish"),
+    "Manipuri": ("Laishram", "Laishram"), "Marathi": ("Sunita", "Sanjay"),
+    "Nepali": ("Amrita", "Amrita"), "Odia": ("Debjani", "Manas"),
+    "Punjabi": ("Divjot", "Gurpreet"), "Sanskrit": ("Aryan", "Aryan"),
+    "Tamil": ("Jaya", "Jaya"), "Telugu": ("Lalitha", "Prakash"),
 }
+VOICES = ["Female", "Male"]
+
+
+def voice_description(lang, voice):
+    f, m = SPEAKERS.get(lang, SPEAKERS["Hindi"])
+    name = f if voice == "Female" else m
+    return (f"{name}'s voice is monotone yet slightly fast in delivery, with a very clear audio "
+            "and a very close recording that almost has no background noise.")
 
 
 def run(cmd, cwd=None):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if r.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + r.stderr[-1500:])
+
+
+def has_audio(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def purge_old_runs(max_age_sec=3600):
+    """Delete leftover work folders from earlier runs."""
+    root = tempfile.gettempdir()
+    for d in os.listdir(root):
+        full = os.path.join(root, d)
+        if d.startswith("ivt_") and os.path.isdir(full) and time.time() - os.path.getmtime(full) > max_age_sec:
+            shutil.rmtree(full, ignore_errors=True)
 
 
 def free():
@@ -130,9 +162,9 @@ def load_tts():
     return _tts
 
 
-def speak(text, voice, out_path):
+def speak(text, voice, out_path, lang="Hindi"):
     t = load_tts()
-    d = t["desc_tok"](VOICES[voice], return_tensors="pt").to(DEVICE)
+    d = t["desc_tok"](voice_description(lang, voice), return_tensors="pt").to(DEVICE)
     p = t["tok"](text, return_tensors="pt").to(DEVICE)
     torch.manual_seed(42)  # keeps the voice consistent across lines
     with torch.no_grad():
@@ -143,28 +175,44 @@ def speak(text, voice, out_path):
     sf.write(out_path, audio, t["model"].config.sampling_rate)
 
 
-def fit_to_slot(wav_path, slot_sec, out_path, max_speed=1.6):
-    """Speed up a line slightly if it's longer than the gap available."""
+def trim_silence(wav_path, out_path, thresh=-45):
+    """Cut the silence TTS leaves at the start/end so the line starts exactly when we say."""
+    a = AudioSegment.from_wav(wav_path)
+    lead = detect_leading_silence(a, silence_threshold=thresh)
+    trail = detect_leading_silence(a.reverse(), silence_threshold=thresh)
+    a[lead:len(a) - trail].export(out_path, format="wav")
+
+
+def fit_to_slot(wav_path, slot_sec, out_path, max_speed=1.6, min_speed=0.85):
+    """Make a line last about as long as the original speaker's line (speed it up if too
+    long, slow it slightly if too short) so voice and mouth movement line up."""
     dur = sf.info(wav_path).duration
     speed = 1.0
-    if slot_sec > 0.3 and dur > slot_sec:
-        speed = min(dur / slot_sec, max_speed)
+    if slot_sec > 0.3:
+        speed = min(max(dur / slot_sec, min_speed), max_speed)
     run(["ffmpeg", "-y", "-i", wav_path, "-filter:a", f"atempo={speed:.3f}",
          "-ar", "44100", "-ac", "1", out_path])
 
 
-def build_dub_track(segs, texts, voice, total_ms, tmp, progress):
+def build_dub_track(segs, texts, voice, total_ms, tmp, progress, lang="Hindi"):
     track = AudioSegment.silent(duration=total_ms, frame_rate=44100)
     n = len(segs)
+    busy_until = 0  # ms; a line never starts before the previous one has finished
     for i, (s, txt) in enumerate(zip(segs, texts)):
         progress(0.55 + 0.3 * i / n, desc=f"Generating voice {i + 1}/{n}")
         if not txt.strip():
             continue
-        raw, fit = f"{tmp}/seg{i}.wav", f"{tmp}/fit{i}.wav"
-        speak(txt, voice, raw)
+        raw, trim, fit = f"{tmp}/seg{i}.wav", f"{tmp}/trim{i}.wav", f"{tmp}/fit{i}.wav"
+        speak(txt, voice, raw, lang)
+        trim_silence(raw, trim)
+        # Aim for the speaker's own mouth-movement time; allow a little spill into the gap
         nxt = segs[i + 1]["start"] if i + 1 < n else s["end"] + 1.0
-        fit_to_slot(raw, nxt - s["start"], fit)
-        track = track.overlay(AudioSegment.from_wav(fit), position=int(s["start"] * 1000))
+        slot_end = max(s["end"], min(nxt - 0.1, s["end"] + 0.4))
+        fit_to_slot(trim, slot_end - s["start"], fit)
+        clip = AudioSegment.from_wav(fit)
+        pos = max(int(s["start"] * 1000), busy_until)
+        track = track.overlay(clip, position=pos)
+        busy_until = pos + len(clip) + 80
     return track
 
 
@@ -172,7 +220,10 @@ def build_dub_track(segs, texts, voice, total_ms, tmp, progress):
 def process(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn, progress=gr.Progress()):
     if not video:
         raise gr.Error("Upload a video first.")
-    tmp = tempfile.mkdtemp()
+    if not has_audio(video):
+        raise gr.Error("This video has no audio track to translate.")
+    purge_old_runs()
+    tmp = tempfile.mkdtemp(prefix="ivt_")
     orig = f"{tmp}/orig.wav"
 
     progress(0.05, desc="Extracting audio")
@@ -198,12 +249,16 @@ def process(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn, progress=
     dub_wav, note = None, ""
     if do_dub:
         if tgt_name in TTS_LANGS:
-            total_ms = len(AudioSegment.from_wav(orig))
-            track = build_dub_track(segs, texts, voice, total_ms, tmp, progress)
-            if keep_bg:
-                track = (AudioSegment.from_wav(orig) - 18).overlay(track)
-            dub_wav = f"{tmp}/dub.wav"
-            track.export(dub_wav, format="wav")
+            try:
+                total_ms = len(AudioSegment.from_wav(orig))
+                track = build_dub_track(segs, texts, voice, total_ms, tmp, progress, tgt_name)
+                if keep_bg:
+                    track = (AudioSegment.from_wav(orig) - 18).overlay(track)
+                dub_wav = f"{tmp}/dub.wav"
+                track.export(dub_wav, format="wav")
+            except Exception as e:  # TTS failed: still deliver subtitles
+                dub_wav = None
+                note = f" Voice dubbing failed ({type(e).__name__}: {e}), so this video has subtitles only."
         else:
             note = f" Voice dubbing isn't available for {tgt_name}, so this video has subtitles only."
 
@@ -226,9 +281,14 @@ def process(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn, progress=
     cmd += ["-c:a", "aac", "-b:a", "192k", out]
     run(cmd, cwd=tmp)
 
+    # Remove big intermediates; keep the final video and .srt for Gradio to serve
+    for f in os.listdir(tmp):
+        if f.endswith(".wav") and f != "dub.wav":
+            os.remove(os.path.join(tmp, f))
+
     status = (f"Done. Spoken language: **{CODE_TO_NAME.get(src, src)}** → "
               f"**{tgt_name}**, {len(segs)} subtitle lines.{note}")
-    return out, srt, status
+    return out, srt, dub_wav, status
 
 
 # ---------- App ----------
@@ -241,20 +301,21 @@ with gr.Blocks(title="Indic Video Translator") as demo:
     with gr.Row():
         src_in = gr.Dropdown(SRC_CHOICES, value="Auto-detect", label="Language spoken in the video")
         tgt_in = gr.Dropdown(sorted(LANGS), value="Hindi", label="Translate into")
-    voice_in = gr.Radio(list(VOICES), value="Female", label="Dubbing voice")
+    voice_in = gr.Radio(VOICES, value="Female", label="Dubbing voice")
     dub_in = gr.Checkbox(value=True, label="Dub the audio")
     bg_in = gr.Checkbox(value=True, label="Keep the original sound quietly in the background")
     burn_in = gr.Checkbox(value=True, label="Show subtitles on the video (burned in)")
     btn = gr.Button("Translate", variant="primary")
     video_out = gr.Video(label="Translated video")
     srt_out = gr.File(label="Subtitle file (.srt)")
+    dub_out = gr.File(label="Dubbed audio (.wav) - use this for lip-sync, see LIPSYNC.md")
     status_out = gr.Markdown()
     btn.click(process, [video_in, src_in, tgt_in, voice_in, dub_in, bg_in, burn_in],
-              [video_out, srt_out, status_out])
+              [video_out, srt_out, dub_out, status_out])
 
 if __name__ == "__main__":
     # Set SHARE=1 to get a temporary public link (e.g. when running on Google Colab)
     share = os.environ.get("SHARE", "0") == "1"
     print(f"Running on: {DEVICE.upper()}" + ("" if DEVICE == "cuda" else
           "  (no GPU found - dubbing will be slow; try short clips first)"))
-    demo.queue().launch(share=share, inbrowser=not share, debug=True)
+    demo.queue().launch(share=share, inbrowser=not share)

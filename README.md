@@ -1,4 +1,4 @@
-# Indic Video Translator
+﻿# Whisper Video Translator
 
 Upload a video, choose an Indian language, and get:
 

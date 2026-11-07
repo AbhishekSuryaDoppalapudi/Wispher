@@ -1,11 +1,12 @@
-torch
+﻿torch
 torchaudio
-transformers
-sentencepiece
-openai-whisper
-gradio
+transformers==4.46.1  # parler-tts pins this version
+sentencepiece==0.2.0  # newer versions need protobuf>=6, which conflicts with parler-tts deps
+openai-whisper>=20240930  # needed for the "turbo" model
+gradio>=4
 pydub
 soundfile
-numpy
+numpy<2
 IndicTransToolkit
 git+https://github.com/huggingface/parler-tts.git
+protobuf==4.25.9
