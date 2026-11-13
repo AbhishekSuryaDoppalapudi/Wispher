@@ -67,7 +67,6 @@ try:
     from IndicTransToolkit.processor import IndicProcessor
 except ImportError:
     from IndicTransToolkit import IndicProcessor
-from parler_tts import ParlerTTSForConditionalGeneration
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -213,6 +212,7 @@ _tts = {}
 def load_tts():
     if not _tts:
         name = "ai4bharat/indic-parler-tts"
+        from parler_tts import ParlerTTSForConditionalGeneration  # lazy: needs torchaudio
         m = ParlerTTSForConditionalGeneration.from_pretrained(name).to(DEVICE)
         _tts["model"] = m
         _tts["tok"] = AutoTokenizer.from_pretrained(name)
