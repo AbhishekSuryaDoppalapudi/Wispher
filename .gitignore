@@ -17,3 +17,9 @@ outputs/
 .env
 .vscode/
 .DS_Store
+
+# Story video work files (clips, audio, outputs)
+story_work/
+
+# Personal data: who translated what (Excel log)
+records/

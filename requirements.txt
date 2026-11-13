@@ -10,3 +10,5 @@ numpy<2
 IndicTransToolkit
 git+https://github.com/huggingface/parler-tts.git
 protobuf==4.25.9
+openpyxl
+segno

@@ -1,5 +1,7 @@
 ﻿# Whisper Video Translator
 
+Developed and created by **Abhishek Surya Doppalapudi**.
+
 Upload a video, choose an Indian language, and get:
 
 - a **subtitle file (.srt)** in that language
