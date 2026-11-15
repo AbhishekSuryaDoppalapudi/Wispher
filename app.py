@@ -408,83 +408,6 @@ def _translate_impl(video, src_choice, tgt_name, voice, do_dub, keep_bg, burn,
     return out, srt, dub_wav, status
 
 
-# ---------- Video making (story pipeline) ----------
-def _sv():
-    from story_video import story_video as sv
-    return sv
-
-
-def _scenes_file(project):
-    sv = _sv()
-    return os.path.join(sv.WORK, sv.clean_name(project), "scenes.json")
-
-
-def st_plan(script, project, style, max_words):
-    sv = _sv()
-    if not (script or "").strip():
-        raise gr.Error("Paste your script first.")
-    scenes = sv.plan(script, project, max_words, style or sv.DEFAULT_STYLE)
-    words = sum(len(x["text"].split()) for x in scenes)
-    rows = [[x["id"], x["text"], x["visual"]] for x in scenes]
-    return rows, (f"**{len(scenes)} scenes**, {words} words, about **{words / 150:.1f} min** of "
-                  "narration. Check the table, then go to step 2.")
-
-
-def st_narrate(project, lang, voice, progress=gr.Progress()):
-    sv = _sv()
-    if not os.path.exists(_scenes_file(project)):
-        raise gr.Error("Plan the scenes first (step 1).")
-    if lang not in TTS_LANGS:
-        raise gr.Error(f"No dubbing voice for {lang}. Pick another language.")
-    secs = sv.narrate(project, lang, voice, engine=sys.modules[__name__],
-                      cb=lambda f, d: progress(f, desc=d))
-    return f"Narration ready in **{lang}**: {secs / 60:.1f} min. Go to step 3."
-
-
-def st_clips(project, mode, size, uploaded):
-    sv = _sv()
-    if not os.path.exists(_scenes_file(project)):
-        raise gr.Error("Plan the scenes first (step 1).")
-    cdir = os.path.join(sv.WORK, sv.clean_name(project), "clips")
-    os.makedirs(cdir, exist_ok=True)
-    if mode.startswith("My real"):
-        if not uploaded:
-            raise gr.Error("Upload your clips (001.mp4, 002.mp4, ...) or choose placeholder.")
-        for f in uploaded:
-            path = f if isinstance(f, str) else f.name
-            name = os.path.basename(path)
-            if not re.fullmatch(r"\d{3}\.mp4", name):
-                raise gr.Error(f"'{name}' must be named like 001.mp4 (three digits).")
-            shutil.copy(path, os.path.join(cdir, name))
-        note = "Your clips were added."
-    else:
-        _, made = sv.make_placeholder_clips(project, size)
-        note = f"Made {made} placeholder clips (plain colour test clips, not real animation)."
-    scenes = json.load(open(_scenes_file(project), encoding="utf-8"))
-    have = sum(os.path.exists(os.path.join(cdir, f"{x['id']:03d}.mp4")) for x in scenes)
-    return f"{note} {have}/{len(scenes)} scenes have a clip."
-
-
-def st_assemble(project, lang, size, burn, progress=gr.Progress()):
-    sv = _sv()
-    try:
-        out, srt, mins = sv.assemble(project, lang, size, 0.3, burn,
-                                     cb=lambda f, d: progress(f, desc=d))
-    except FileNotFoundError as e:
-        raise gr.Error(str(e))
-    return out, srt, (f"Done: **{mins:.1f} min** video in {lang}. Change the language in the "
-                      "narration step and run again for another language; the clips are reused.")
-
-
-def st_all(script, project, style, max_words, lang, voice, size, burn, progress=gr.Progress()):
-    rows, _ = st_plan(script, project, style, max_words)
-    st_narrate(project, lang, voice, progress=lambda f, desc="": progress(0.05 + 0.6 * f, desc=desc))
-    st_clips(project, "Placeholder (test)", size, None)
-    out, srt, msg = st_assemble(project, lang, size, burn,
-                                progress=lambda f, desc="": progress(0.7 + 0.3 * f, desc=desc))
-    return rows, out, srt, msg
-
-
 # ---------- App ----------
 SRC_CHOICES = ["Auto-detect"] + sorted(n for n, c in LANGS.items() if c in FLORES_TO_WHISPER)
 
@@ -643,7 +566,10 @@ ul.options li span, [role=option] span {color: inherit !important;}
 .hero .by {margin-top: 12px; font-size: .95rem; color:#d9ccff;}
 .hero .by b {background: linear-gradient(90deg,#ff7ac6,#a78bfa,#5ec8ff); -webkit-background-clip: text;
   background-clip: text; color: transparent !important;}
-.foot b {color:#c9b8ff;}
+.corner-credit {position: fixed; right: 14px; bottom: 10px; z-index: 5; pointer-events: none;
+  font-size: .8rem; color: rgba(233,222,252,.55); background: transparent; letter-spacing: .3px;
+  text-shadow: 0 1px 6px rgba(0,0,0,.6);}
+.corner-credit b {color: rgba(255,122,198,.75) !important; font-weight: 600;}
 .foot {text-align:center; color:#7f7aa6; font-size:.85rem; padding: 18px 0 6px;}
 """
 
@@ -651,8 +577,7 @@ with gr.Blocks(title="Whisper Video Translator") as demo:
     gr.HTML('<div class="hero"><h1>Whisper Video Translator</h1>'
             '<p>Translate, dub and create videos in 22 Indian languages. Free, private, on your own machine.</p>'
             '<div class="chips"><span>Whisper</span><span>IndicTrans2</span><span>Indic Parler-TTS</span>'
-            '<span>FFmpeg</span><span>4K output</span></div>'
-            '<div class="by">Developed and created by <b>Abhishek Surya Doppalapudi</b></div></div>')
+            '<span>FFmpeg</span><span>4K output</span></div></div>')
     with gr.Tabs():
         with gr.Tab("Video translation"):
             gr.Markdown("Upload a video, choose a language, and get subtitles plus a dubbed version.")
@@ -719,66 +644,8 @@ with gr.Blocks(title="Whisper Video Translator") as demo:
             btn.click(process, [video_in, src_in, tgt_in, voice_in, dub_in, bg_in, burn_in, start_in, len_in,
                                 res_in, who_token],
                       [video_out, srt_out, dub_out, status_out], show_progress_on=video_out)
-
-        with gr.Tab("Video making"):
-            gr.Markdown(
-                "Turn a script into a 3-5 minute video: **script > scenes > narration > clips > video**. "
-                "Real animated clips need a GPU machine (see `story_video/README.md`); "
-                "here you can test everything with placeholder clips.\n\n"
-                "Separate paragraphs with a blank line. Optionally start a paragraph with a line "
-                "`Visual: ...` describing what to draw.")
-            st_script = gr.Textbox(lines=10, label="Your script",
-                                   placeholder="Visual: a village at sunrise, golden light\n"
-                                               "Long ago, in a quiet village, there lived a child named Ravi...")
-            with gr.Row():
-                st_project = gr.Textbox(value="mystory", label="Project name")
-                st_style = gr.Textbox(value=_sv().DEFAULT_STYLE, label="Visual style (added to every scene)")
-                st_words = gr.Slider(10, 40, value=22, step=1, label="Max words per scene")
-            with gr.Row():
-                st_lang = gr.Dropdown(sorted(TTS_LANGS), value="English", label="Narration language")
-                st_voice = gr.Radio(VOICES, value="Male", label="Voice")
-            with gr.Column(elem_classes="step"):
-                gr.Markdown("### 1. Plan scenes")
-                st_btn1 = gr.Button("1. Plan scenes")
-                st_table = gr.Dataframe(headers=["#", "Narration", "Visual prompt"], interactive=False,
-                                        wrap=True)
-                st_stat1 = gr.Markdown()
-            with gr.Column(elem_classes="step"):
-                gr.Markdown("### 2. Narration (slow on CPU: about 1 minute per scene)")
-                st_btn2 = gr.Button("2. Make narration")
-                st_stat2 = gr.Markdown()
-            with gr.Column(elem_classes="step"):
-                gr.Markdown("### 3. Clips")
-                st_mode = gr.Radio(["Placeholder (test)", "My real clips (upload)"], value="Placeholder (test)",
-                                   label="Clip source")
-                st_up = gr.File(label="Your clips named 001.mp4, 002.mp4, ... (from gpu_clips.py)",
-                                file_count="multiple", file_types=[".mp4"])
-                st_btn3 = gr.Button("3. Prepare clips")
-                st_stat3 = gr.Markdown()
-            with gr.Column(elem_classes="step"):
-                gr.Markdown("### 4. Build the video")
-                with gr.Row():
-                    st_size = gr.Dropdown(["1280x720", "1920x1080", "3840x2160"], value="1920x1080",
-                                          label="Video size")
-                    st_burn = gr.Checkbox(value=False, label="Burn subtitles into the picture")
-                st_btn4 = gr.Button("4. Build video", variant="primary")
-                st_video = gr.Video(label="Finished video")
-                st_srt = gr.File(label="Subtitles (.srt)")
-                st_stat4 = gr.Markdown()
-            gr.Markdown("---\n**Quick test:** run all four steps at once with placeholder clips.")
-            st_btn_all = gr.Button("Run all steps (test)", variant="primary")
-
-            st_btn1.click(st_plan, [st_script, st_project, st_style, st_words], [st_table, st_stat1])
-            st_btn2.click(st_narrate, [st_project, st_lang, st_voice], [st_stat2],
-                          show_progress_on=st_stat2)
-            st_btn3.click(st_clips, [st_project, st_mode, st_size, st_up], [st_stat3])
-            st_btn4.click(st_assemble, [st_project, st_lang, st_size, st_burn],
-                          [st_video, st_srt, st_stat4], show_progress_on=st_video)
-            st_btn_all.click(st_all, [st_script, st_project, st_style, st_words, st_lang, st_voice,
-                                      st_size, st_burn], [st_table, st_video, st_srt, st_stat4],
-                             show_progress_on=st_video)
-    gr.HTML('<div class="foot">Runs fully on your computer. Nothing is uploaded anywhere.<br>'
-            'Developed and created by <b>Abhishek Surya Doppalapudi</b></div>')
+    gr.HTML('<div class="foot">Runs fully on your computer. Nothing is uploaded anywhere.</div>'
+            '<div class="corner-credit">Developed and created by <b>Abhishek Surya Doppalapudi</b></div>')
 
 if __name__ == "__main__":
     # Set SHARE=1 to get a temporary public link (e.g. when running on Google Colab)
